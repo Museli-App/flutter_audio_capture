@@ -20,7 +20,7 @@ $ flutter pub get
 
 ### Android
 
-If you want to use this package on Android OS, you need to set `RECORD_AUDIO` permission to `AndroindManifest.xml` like below.
+If you want to use this package on Android OS, you need to set `RECORD_AUDIO` permission to `AndroidManifest.xml` like below.
 
 ```
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -42,6 +42,27 @@ If you want to use this package on iOS, you need to set `NSMicrophoneUsageDescri
 ...
 ```
 
+The plugin does not configure the audio session itself, so your app must
+activate a record-capable `AVAudioSession` before calling `start()`. The
+easiest way from Dart is the
+[`audio_session`](https://pub.dev/packages/audio_session) package:
+
+```dart
+import 'package:audio_session/audio_session.dart';
+
+final session = await AudioSession.instance;
+await session.configure(AudioSessionConfiguration(
+  avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+  avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.mixWithOthers,
+  avAudioSessionMode: AVAudioSessionMode.measurement,
+));
+await session.setActive(true);
+```
+
+Any equivalent native configuration (e.g. in your `AppDelegate`) works too.
+Without it the session stays in the default `.soloAmbient` category, which
+does not permit recording, and `start()` will report an error.
+
 ### Linux
 
 On Linux, this package uses [`parec`](https://manpages.debian.org/testing/pulseaudio-utils/parec.1.en.html) to record audio.
@@ -58,10 +79,8 @@ import 'package:flutter_audio_capture/flutter_audio_capture.dart';
 ...
 
 // Callback function if device capture new audio stream.
-// argument is audio stream buffer captured through mictophone.
-// Currentry, you can only get is as Float64List.
-void listener(dynamic obj) {
-  var buffer = Float64List.fromList(obj.cast<double>());
+// argument is audio stream buffer captured through microphone.
+void listener(Float32List buffer) {
   print(buffer);
 }
 
@@ -74,9 +93,6 @@ void onError(Object e) {
 ...
 
 FlutterAudioCapture plugin = new FlutterAudioCapture();
-
-// Initialize the plugin (required before start)
-await plugin.init();
 
 // Start to capture audio stream buffer
 // sampleRate: sample rate you want

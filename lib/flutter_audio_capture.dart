@@ -20,8 +20,6 @@ class FlutterAudioCapture {
   // ignore: cancel_subscriptions
   StreamSubscription? _audioCaptureEventChannelSubscription;
 
-  static const _audioCaptureMethodChannel = MethodChannel(AUDIO_CAPTURE_METHOD_CHANNEL_NAME);
-
   double? _actualSampleRate;
 
   /// Starts listenening to audio.

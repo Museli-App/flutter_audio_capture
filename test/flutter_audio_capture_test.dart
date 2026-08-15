@@ -23,13 +23,15 @@ void main() {
   });
 
   tearDown(() {
-    channel.setMockMethodCallHandler(null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, null);
     reset(mock);
   });
 
   void setupMockMethodCallHandlerWithMockFunctions(
       Function mockOnListen, Function mockOnCancel) {
-    channel.setMockMethodCallHandler((MethodCall methodCall) async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
       switch (methodCall.method) {
         case "listen":
           {
@@ -46,6 +48,7 @@ void main() {
             throw "Error occured in mock methodCallHandler";
           }
       }
+      return null;
     });
   }
 

@@ -23,12 +23,6 @@ public class SwiftFlutterAudioCapturePlugin: NSObject, FlutterPlugin {
         switch call.method {
         case "getSampleRate":
             result(instance.actualSampleRate)
-        case "init":
-            do {
-                result(try instance.setup())
-            } catch {
-                result(FlutterError(code: "initFailed", message: "Error occured in init", details: error.localizedDescription))
-            }
         default:
             result(FlutterMethodNotImplemented)
         }
