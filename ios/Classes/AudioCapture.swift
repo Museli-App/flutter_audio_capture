@@ -1,150 +1,222 @@
 import AVFoundation
 
-/// `AudioCapture` taps the audio input node and delivers Float32 mono PCM in
-/// fixed `bufferSize`-frame chunks.
-///
-/// The audio session (category / mode / preferred sample rate) is owned by the
-/// host app; this plugin never touches `AVAudioSession`.
-///
-/// All per-session mutable state (converter, pending samples) is captured by
-/// the tap closure and touched only on the tap's render thread, so start/stop
-/// on the platform thread never race it. The class itself holds only the
-/// engine.
+/// The host owns the audio session; the sink only copies hardware PCM.
 public class AudioCapture {
-    /// `audioEngine` is an instance of `AVAudioEngine` used for audio input.
     let audioEngine = AVAudioEngine()
+    private var sink: AVAudioSinkNode?
+    private var pipeline: CapturePipeline?
 
-    /// `startSession` starts the audio recording session.
-    /// It installs a tap on the input node of the audio engine to capture audio data.
-    /// - Parameters:
-    ///   - bufferSize: Frames per emitted chunk. iOS clamps `installTap`'s own
-    ///     buffer size up to ~100 ms whatever is asked, so the requested
-    ///     granularity is honoured by re-chunking here instead.
-    ///   - sampleRate: The sample rate to convert the captured audio to.
-    ///   - cb: A callback function that is called with the audio data and sample rate.
-    /// - Returns: The sample rate the emitted samples are actually at.
-    /// - Throws: An error if the audio engine could not be started.
-    public func startSession(bufferSize: UInt32, sampleRate: Double, cb: @escaping (FlutterStandardTypedData?, Double, Error?) -> Void) throws -> Double {
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.inputFormat(forBus: 0)
-
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw AudioCapture.failure("Invalid input format")
+    func startSession(bufferSize: UInt32, sampleRate: Double, queue: CaptureQueue) throws {
+        stopSession()
+        let input = audioEngine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        let pipeline = try CapturePipeline(format: format, frames: Int(bufferSize), rate: sampleRate, queue: queue)
+        let sink = AVAudioSinkNode { timestamp, frames, buffers in
+            let stamp = timestamp.pointee
+            let valid = stamp.mFlags.contains(.hostTimeValid) && stamp.mFlags.contains(.sampleTimeValid)
+                && stamp.mSampleTime.isFinite && stamp.mSampleTime >= Double(Int64.min)
+                && stamp.mSampleTime < Double(Int64.max)
+            CaptureInputRingOffer(pipeline.ring, buffers, frames,
+                valid ? Int64(stamp.mSampleTime) : 0, stamp.mHostTime, valid)
+            return noErr
         }
-        guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false) else {
-            throw AudioCapture.failure("Invalid output format")
-        }
-
-        // When the hardware already delivers what was asked for, ship the tap
-        // buffer untouched — no resampler is the best resampler, and it is the
-        // path the app takes when it requests the session's own rate.
-        let needsConversion = inputFormat.sampleRate != outputFormat.sampleRate
-            || inputFormat.channelCount != outputFormat.channelCount
-            || inputFormat.commonFormat != outputFormat.commonFormat
-
-        // ONE converter for the session: a resampler carries polyphase filter
-        // state across buffers; rebuilding it per callback zeroes that state and
-        // splices a priming transient into every chunk boundary.
-        let converter: AVAudioConverter?
-        if needsConversion {
-            guard let c = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-                throw AudioCapture.failure("AVAudioConverter initialization failed")
-            }
-            c.sampleRateConverterQuality = AVAudioQuality.high.rawValue
-            converter = c
-        } else {
-            converter = nil
-        }
-
-        // Emissions are always at the requested rate: either the converter
-        // produces it, or the input is already at it.
-        let reportedRate = outputFormat.sampleRate
-        let emitFrames = bufferSize > 0 ? Int(bufferSize) : 512
-
-        // Converted samples not yet emitted. Captured by the tap closure and
-        // touched only on its thread; any sub-chunk tail dies with the closure
-        // on stop.
-        var pending = [Float]()
-        pending.reserveCapacity(emitFrames * 16)
-
-        inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) { (buffer, _) in
-            do {
-                pending.append(contentsOf: try AudioCapture.samples(from: buffer, converter: converter, outputFormat: outputFormat))
-            } catch {
-                cb(nil, reportedRate, error)
-                return
-            }
-            // Emit whole chunks via a cursor, then compact ONCE — not one O(n)
-            // removeFirst per chunk on the render thread.
-            var start = 0
-            while pending.count - start >= emitFrames {
-                let data = pending[start..<start + emitFrames].withUnsafeBufferPointer { Data(buffer: $0) }
-                cb(FlutterStandardTypedData(float32: data), reportedRate, nil)
-                start += emitFrames
-            }
-            if start > 0 { pending.removeFirst(start) }
-        }
-
+        self.pipeline = pipeline
+        self.sink = sink
+        audioEngine.attach(sink)
+        audioEngine.connect(input, to: sink, format: format)
+        pipeline.start()
         do {
+            audioEngine.prepare()
             try audioEngine.start()
         } catch {
-            // Leave no tap behind: a second installTap on a tapped bus is an
-            // uncatchable ObjC exception.
-            inputNode.removeTap(onBus: 0)
+            stopSession()
             throw error
         }
-        return reportedRate
     }
 
-    /// `stopSession` stops the audio recording session.
-    /// It removes the tap on the input node of the audio engine and stops the audio engine.
     public func stopSession() {
-        audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
+        if let sink = sink {
+            audioEngine.disconnectNodeInput(sink)
+            audioEngine.detach(sink)
+        }
+        sink = nil
+        pipeline?.stop()
+        pipeline = nil
     }
 
-    /// The tap buffer's Float32 mono samples, converted only if it has to be.
-    private static func samples(from buffer: AVAudioPCMBuffer, converter: AVAudioConverter?, outputFormat: AVAudioFormat) throws -> [Float] {
-        guard let converter = converter else {
-            return try floats(of: buffer)
-        }
+    deinit { stopSession() }
+}
 
-        // Room for this buffer's worth of output (+1 rounding slack); the
-        // converter retains anything that doesn't fit and emits it next call.
-        let ratio = outputFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 1
-        guard let out = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            throw failure("Could not allocate the converted buffer")
-        }
+final class CapturePipeline {
+    let ring: OpaquePointer
+    private let input: AVAudioPCMBuffer
+    private let converted: AVAudioPCMBuffer
+    private let converter: AVAudioConverter?
+    private let frames: Int
+    private let pending: UnsafeMutablePointer<Float>
+    private let queue: CaptureQueue
+    private var clock: CaptureSampleClock
+    private var filled = 0
+    private(set) var emitted: Int64 = 0
+    private var nextInputSample: Int64?
+    private var gap = false
+    private var worker: Thread?
+    private let finished = DispatchGroup()
 
-        // One-shot input: this buffer is offered exactly once. The resulting
-        // `.inputRanDry` is success — it means the converter drained everything
-        // it was given rather than looping back over it.
-        var supplied = false
-        var error: NSError?
-        let status = converter.convert(to: out, error: &error) { _, outStatus in
-            if supplied {
-                outStatus.pointee = .noDataNow
-                return nil
+    init(format: AVAudioFormat, frames: Int, rate: Double, queue: CaptureQueue) throws {
+        let maximumFrames: AVAudioFrameCount = 16384
+        guard format.sampleRate > 0, format.channelCount > 0, format.channelCount <= 8,
+              format.commonFormat == .pcmFormatFloat32, frames > 0, rate > 0,
+              let output = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                sampleRate: rate, channels: 1, interleaved: false),
+              let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: maximumFrames),
+              let converted = AVAudioPCMBuffer(pcmFormat: output,
+                frameCapacity: AVAudioFrameCount(ceil(Double(maximumFrames) * rate / format.sampleRate)) + 4096)
+        else { throw Self.failure("Invalid capture format or buffer allocation") }
+        let conversionNeeded = format.sampleRate != rate || format.channelCount != 1 || format.isInterleaved
+        let converter = conversionNeeded ? AVAudioConverter(from: format, to: output) : nil
+        guard !conversionNeeded || converter != nil else { throw Self.failure("Cannot create converter") }
+        converter?.sampleRateConverterQuality = AVAudioQuality.high.rawValue
+        let planes = format.isInterleaved ? 1 : format.channelCount
+        guard let ring = CaptureInputRingCreate(32, maximumFrames, planes,
+            format.streamDescription.pointee.mBytesPerFrame) else {
+            throw Self.failure("Cannot allocate lock-free capture storage")
+        }
+        self.ring = ring
+        self.input = input
+        self.converted = converted
+        self.converter = converter
+        self.frames = frames
+        self.queue = queue
+        clock = CaptureSampleClock(inputRate: format.sampleRate, outputRate: rate)
+        pending = .allocate(capacity: frames)
+        pending.initialize(repeating: 0, count: frames)
+    }
+
+    func start() {
+        finished.enter()
+        let thread = Thread { [self] in
+            defer { finished.leave() }
+            run()
+        }
+        thread.name = "museli.capture.convert"
+        thread.qualityOfService = .userInitiated
+        worker = thread
+        thread.start()
+    }
+
+    func stop() {
+        CaptureInputRingClose(ring)
+        if worker != nil { finished.wait(); worker = nil }
+    }
+
+    private func run() {
+        do {
+            while !CaptureInputRingIsClosed(ring) {
+                if try !drainOnce() { Thread.sleep(forTimeInterval: 0.002) }
             }
-            supplied = true
-            outStatus.pointee = .haveData
-            return buffer
-        }
-
-        if let error = error { throw error }
-        if status == .error { throw failure("Audio conversion failed") }
-        return try floats(of: out)
+        } catch { queue.close(error) }
     }
 
-    private static func floats(of buffer: AVAudioPCMBuffer) throws -> [Float] {
-        guard let channel = buffer.floatChannelData else {
-            throw failure("Expected float32 samples")
+    /// Converts one ring packet into the queue; false when none is ready.
+    func drainOnce() throws -> Bool {
+        var packet = CaptureInputPacket()
+        input.frameLength = input.frameCapacity
+        guard CaptureInputRingRead(ring, input.mutableAudioBufferList, &packet) else {
+            let error = CaptureInputRingError(ring)
+            if error != 0 { throw Self.failure("Input callback failed (\(error))") }
+            return false
         }
-        return Array(UnsafeBufferPointer(start: channel[0], count: Int(buffer.frameLength)))
+        input.frameLength = packet.frameCount
+        try process(packet)
+        return true
+    }
+
+    private func process(_ packet: CaptureInputPacket) throws {
+        let captureNs = CaptureSampleClock.hostNs(packet.hostTicks)
+        let inputGap = packet.discontinuity || (nextInputSample.map { $0 != packet.inputFrame } ?? false)
+        if clock.observe(inputFrame: packet.inputFrame, hostNs: captureNs,
+            outputFrame: emitted, discontinuity: inputGap) {
+            filled = 0
+            converter?.reset()
+            gap = true
+        }
+        nextInputSample = packet.inputFrame + Int64(packet.frameCount)
+        let pcm: AVAudioPCMBuffer
+        if let converter = converter {
+            var supplied = false
+            var error: NSError?
+            converted.frameLength = 0
+            let status = converter.convert(to: converted, error: &error) { [input] _, status in
+                if supplied { status.pointee = .noDataNow; return nil }
+                supplied = true
+                status.pointee = .haveData
+                return input
+            }
+            if let error = error { throw error }
+            guard status != .error else { throw Self.failure("Audio conversion failed") }
+            pcm = converted
+        } else { pcm = input }
+        guard let samples = pcm.floatChannelData?[0] else { throw Self.failure("Expected Float32 input") }
+        var cursor = 0
+        while cursor < Int(pcm.frameLength) {
+            let count = min(frames - filled, Int(pcm.frameLength) - cursor)
+            pending.advanced(by: filled).update(from: samples.advanced(by: cursor), count: count)
+            filled += count
+            cursor += count
+            if filled < frames { continue }
+            queue.offer(pending, position: emitted, timeNs: clock.time(outputFrame: emitted), discontinuity: gap)
+            emitted += Int64(frames)
+            filled = 0
+            gap = false
+        }
     }
 
     private static func failure(_ message: String) -> NSError {
-        return NSError(domain: "AudioCapture", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+        NSError(domain: "AudioCapture", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    deinit {
+        pending.deinitialize(count: frames)
+        pending.deallocate()
+        CaptureInputRingDestroy(ring)
+    }
+}
+
+/// Retains converter phase while following the hardware clock on every tap.
+struct CaptureSampleClock {
+    let inputRate: Double
+    let outputRate: Double
+    private var firstInputFrame: Int64?
+    private var firstOutputFrame: Int64 = 0
+    private var originNs: Int64 = 0
+
+    init(inputRate: Double, outputRate: Double) {
+        self.inputRate = inputRate
+        self.outputRate = outputRate
+    }
+
+    /// The one host-tick conversion; capture stamps and the Dart clock exchange must agree.
+    static func hostNs(_ ticks: UInt64) -> Int64 {
+        Int64(AVAudioTime.seconds(forHostTime: ticks) * 1_000_000_000)
+    }
+
+    mutating func observe(inputFrame: Int64, hostNs: Int64, outputFrame: Int64,
+        discontinuity: Bool = false) -> Bool {
+        var gap = discontinuity
+        if let first = firstInputFrame, !gap {
+            let projected = hostNs - Int64(Double(inputFrame - first) * 1_000_000_000 / inputRate)
+            gap = abs(projected - originNs) > 5_000_000
+            if !gap { originNs = projected; return false }
+        }
+        firstInputFrame = inputFrame
+        firstOutputFrame = outputFrame
+        originNs = hostNs
+        return gap
+    }
+
+    func time(outputFrame: Int64) -> Int64 {
+        originNs + Int64(Double(outputFrame - firstOutputFrame) * 1_000_000_000 / outputRate)
     }
 }

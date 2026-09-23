@@ -5,192 +5,115 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.MediaRecorder
-import android.os.Build
-import android.util.Log
-import android.os.Handler
-import android.os.Looper
+import android.media.AudioRouting
+import android.media.AudioTimestamp
+import java.util.concurrent.atomic.AtomicLong
 
-import io.flutter.plugin.common.EventChannel.StreamHandler
-import io.flutter.plugin.common.EventChannel.EventSink
-import java.lang.Exception
-import kotlin.math.max
+internal class AudioCaptureStreamHandler(private val context: Context) {
+    private val generations = AtomicLong()
+    @Volatile private var session: Session? = null
 
-public class AudioCaptureStreamHandler(private val context: Context): StreamHandler {
-    public val eventChannelName = "ymd.dev/audio_capture_event_channel"
-    public var actualSampleRate: Int = 0
-    
-    private val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
-    private val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_FLOAT
-    private var AUDIO_SOURCE: Int = MediaRecorder.AudioSource.DEFAULT
-    private var SAMPLE_RATE: Int = 44000
-    private var BUFFER_SIZE: Int = 0
-
-    private val TAG: String = "AudioCaptureStream"
-    private var isCapturing: Boolean = false
-    private var listener = null
-    private var thread: Thread? = null
-    private var _events: EventSink? = null
-    private val uiThreadHandler: Handler = Handler(Looper.getMainLooper())
-
-    override fun onListen(arguments: Any?, events: EventSink?) {
-        Log.d(TAG, "onListen started")
-        if (arguments != null && arguments is Map<*, *>) {
-            val sampleRate = arguments["sampleRate"]
-            if (sampleRate != null && sampleRate is Int) {
-                SAMPLE_RATE = sampleRate
-            }
-            val audioSource = arguments["audioSource"]
-            if (audioSource != null && audioSource is Int) {
-                AUDIO_SOURCE = audioSource
-            }
-            val bufferSize = arguments["bufferSize"]
-            if (bufferSize != null && bufferSize is Int) {
-                BUFFER_SIZE = bufferSize
-            }
+    fun start(rate: Int, blockSize: Int, source: Int?, clientId: String?): Map<String, Any> {
+        require(rate in 8000..192000 && blockSize in 64..8192)
+        stop(null)
+        val minimum = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+        check(minimum > 0) { "Unsupported capture format ($minimum)" }
+        val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val selectedSource = selectCaptureSource(source,
+            manager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true")
+        val recorder = AudioRecord.Builder().setAudioSource(selectedSource)
+            .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                .setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
+            .setBufferSizeInBytes(maxOf(minimum, blockSize * 4 * 2)).build()
+        try {
+            check(recorder.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
+            val mic = manager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+            // Best effort, as before timestamped capture: without the built-in mic, record the default route.
+            val preferred = if (mic != null && recorder.setPreferredDevice(mic)) mic.id else -1
+            recorder.startRecording()
+            check(recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "AudioRecord did not start" }
+            // A preference is not a route; report the routed input once recording has one.
+            val inputId = recorder.routedDevice?.id ?: preferred
+            val current = Session(generations.incrementAndGet(), recorder, blockSize, clientId)
+            session = current
+            current.thread.start()
+            return mapOf("generation" to current.generation, "sampleRate" to recorder.sampleRate,
+                "inputId" to inputId.toString(), "audioSource" to recorder.audioSource)
+        } catch (error: Throwable) {
+            recorder.release()
+            throw error
         }
-        
-        this._events = events
-        startRecording()
     }
 
-    override fun onCancel(p0: Any?) {
-        Log.d(TAG, "onListen canceled")
-        stopRecording()
+    fun read(generation: Long, maxBlocks: Int): List<Map<String, Any>> {
+        val current = session ?: error("Capture stopped")
+        check(current.generation == generation) { "Stale capture generation" }
+        return current.queue.take(generation, current.sampleRate, maxBlocks.coerceIn(1, 8))
     }
 
-    public fun startRecording() {
-        if (thread != null) return
-
-        isCapturing = true
-        val runnableObj: Runnable = object: Runnable {
-          override public fun run() {
-              record()
-          }
-        }
-        thread = Thread(runnableObj)
-        thread?.start()
+    fun stop(generation: Long?, clientId: String? = null) {
+        val current = session ?: return
+        if (generation != null && generation != current.generation) return
+        if (clientId != null && clientId != current.clientId) return
+        current.running = false
+        current.queue.close()
+        // AudioRecord.stop interrupts READ_BLOCKING; joining alone cannot.
+        try { current.recorder.stop() } catch (_: IllegalStateException) {}
+        current.thread.join(1000)
+        check(!current.thread.isAlive) { "Capture worker did not stop" }
+        session = null
     }
 
-    public fun stopRecording() {
-        if (thread == null) return
-        isCapturing = false
-        // Log.d(TAG, "stopping recording, isCapturing = " + isCapturing)
-        
-        actualSampleRate = 1 // -> we are currently stopping
-        thread?.join(5000)
-        thread = null
-        actualSampleRate = 2 // -> we are stopped
-    }
+    private class Session(val generation: Long, val recorder: AudioRecord, val blockSize: Int, val clientId: String?) {
+        val sampleRate = recorder.sampleRate
+        @Volatile var running = true
+        @Volatile private var routeDirty = true // set by the routing listener; the first block seeds the route
+        // AudioRouting's type, so registration skips the deprecated AudioRecord overload.
+        private val routing = AudioRouting.OnRoutingChangedListener { routeDirty = true }
+        val queue = CaptureQueue(blockSize, CaptureQueue.capacity(sampleRate, blockSize))
+        val thread = Thread({ record() }, "museli-capture")
 
-    private fun sendError(key: String?, msg: String?) {
-        uiThreadHandler.post(object: Runnable {
-            override fun run() {
-                if (isCapturing) {
-                    _events?.error(key, msg, null)
-                }
-            }
-        })
-    }
-
-    private fun sendBuffer(audioBuffer: ArrayList<FloatArray>, bufferIndex: Int) {
-        uiThreadHandler.post(object: Runnable {
-            var index: Int = -1
-
-            override fun run() {
-                if (isCapturing) {
-                    // Send the actualSampleRate as a special event
-                    val data = mapOf(
-                        "actualSampleRate" to actualSampleRate.toDouble(),
-                        "audioData" to audioBuffer[index]
-                    )
-                    _events?.success(data)
-                }
-            }
-
-            public fun init(idx: Int): Runnable {
-                this.index = idx
-                return this
-            }
-
-        }.init(bufferIndex))
-    }
-
-    private fun record() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
-        
-        val minBufferBytes = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            CHANNEL_CONFIG,
-            AUDIO_FORMAT
-        )
-
-        val userBufferSamples = if (BUFFER_SIZE > 0) BUFFER_SIZE else minBufferBytes / 4
-        val userBufferBytes = userBufferSamples * 4   // float32 = 4 bytes
-        val finalBufferBytes = max(userBufferBytes, minBufferBytes)
-        val finalBufferSamples = finalBufferBytes / 4
-        val bufferCount = 10
-        var bufferIndex = 0
-
-        val audioBuffer = ArrayList<FloatArray>(bufferCount)
-        repeat(bufferCount) {
-            audioBuffer.add(FloatArray(finalBufferSamples))
-        }
-
-        val record = AudioRecord.Builder()
-            .setAudioSource(AUDIO_SOURCE)
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AUDIO_FORMAT)
-                    .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(CHANNEL_CONFIG)
-                    .build()
-            )
-            .setBufferSizeInBytes(finalBufferBytes)
-            .build()
-
-        if (record.getState() != AudioRecord.STATE_INITIALIZED) {
-            sendError("AUDIO_RECORD_INITIALIZE_ERROR", "AudioRecord can't initialize")
-        }
-
-        // Force the built-in mic so a connected wired/BT headset mic is never
-        // used — the app always wants the phone's own mic. API 23+.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        private fun record() {
+            val timestamp = AudioTimestamp()
+            // Extrapolating the last anchor keeps one timebase when getTimestamp fails mid-stream.
+            var anchorFrame = 0L
+            var anchorNs = 0L
+            var anchored = false
+            var routeId: Int? = null
             try {
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                val builtInMic = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
-                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-                if (builtInMic != null) {
-                    record.setPreferredDevice(builtInMic)
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+                recorder.addOnRoutingChangedListener(routing, null) // null: the main looper; this thread has none
+                CaptureBlockReader(blockSize).run(
+                    read = { buffer, offset, size -> recorder.read(buffer, offset, size, AudioRecord.READ_BLOCKING) },
+                    running = { running }
+                ) { buffer, position ->
+                    // A mic change keeps recording but marks a gap: analysis resets, block timestamps stay fresh.
+                    if (routeDirty) {
+                        routeDirty = false
+                        recorder.routedDevice?.id?.let { id ->
+                            if (routeId != null && routeId != id) queue.markGap()
+                            routeId = id
+                        }
+                    }
+                    val rate = sampleRate
+                    if (recorder.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS) {
+                        anchorFrame = timestamp.framePosition
+                        anchorNs = timestamp.nanoTime
+                        anchored = true
+                    }
+                    val timeNs = if (anchored) anchorNs + (position - anchorFrame) * 1_000_000_000L / rate
+                        else System.nanoTime() - blockSize * 1_000_000_000L / rate
+                    queue.offer(buffer, position, timeNs)
                 }
-            } catch (e: Exception) {
-                Log.d(TAG, "setPreferredDevice(built-in mic) failed: $e")
+            } catch (error: Throwable) {
+                if (running) queue.close(error)
+            } finally {
+                running = false
+                try { recorder.stop() } catch (_: IllegalStateException) {}
+                recorder.removeOnRoutingChangedListener(routing)
+                recorder.release()
             }
         }
-
-        record.startRecording()
-        
-        actualSampleRate = record.getSampleRate()
-        
-        while (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-          Thread.yield() 
-        }
-          
-        // Log.d(TAG, "recording started, isCapturing = " + isCapturing + ", actualSampleRate = " + actualSampleRate)
-        
-        while (isCapturing) {
-            try {
-                record.read(audioBuffer[bufferIndex], 0, audioBuffer[bufferIndex].size, AudioRecord.READ_BLOCKING)
-                sendBuffer(audioBuffer, bufferIndex)
-            } catch (e: Exception) {
-                Log.d(TAG, e.toString())
-                sendError("AUDIO_RECORD_READ_ERROR", "AudioRecord can't read")
-                Thread.yield()
-            }
-            bufferIndex = (bufferIndex+1) % bufferCount
-        }
-
-        record.stop()
-        record.release()
     }
 }

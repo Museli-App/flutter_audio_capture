@@ -4,15 +4,14 @@ version: 1.1.12
 homepage: https://github.com/ysak-y/flutter_audio_capture
 
 environment:
-  sdk: ">=2.12.0 <4.0.0"
-  flutter: ">=1.19.0"
+  sdk: ">=2.19.0 <4.0.0"
+  flutter: ">=3.7.0"
 
 dependencies:
   flutter:
     sdk: flutter
 
 dev_dependencies:
-  mockito: ^5.0.5
   flutter_test:
     sdk: flutter
 
@@ -23,6 +22,4 @@ flutter:
         package: com.ymd.flutter_audio_capture
         pluginClass: FlutterAudioCapturePlugin
       ios:
-        pluginClass: FlutterAudioCapturePlugin
-      linux:
         pluginClass: FlutterAudioCapturePlugin

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-flutter_audio_capture is a Flutter plugin that captures audio stream buffer from the microphone. It supports iOS 13+, Android 23+, and Linux (with PulseAudio).
+flutter_audio_capture is a Flutter plugin that captures audio stream buffer from the microphone. It supports iOS 13+ and Android 24+.
 
 ## Build and Development Commands
 
@@ -29,14 +29,12 @@ cd example && flutter run
 
 This is a Flutter federated plugin with platform-specific implementations communicating via Flutter platform channels:
 
-- **Dart API** (`lib/flutter_audio_capture.dart`): Main `FlutterAudioCapture` class using `EventChannel` for audio stream and `MethodChannel` for control commands
+- **Dart API** (`lib/flutter_audio_capture.dart`): `CaptureSession` request/response reads over a `MethodChannel`, plus the `FlutterAudioCapture` compatibility facade
 - **Android** (`android/src/main/kotlin/`): Kotlin implementation using `AudioRecord` API with a background thread for capturing. `AudioCaptureStreamHandler` handles the actual recording loop
-- **iOS** (`ios/Classes/`): Swift implementation using `AVAudioEngine` with an audio tap for buffer capture. `AudioCapture` manages only the engine — the host app owns the `AVAudioSession` (category, mode, activation) and must configure a record-capable one before `start()`
-- **Linux** (`linux/`): C++ implementation spawning `parec` (PulseAudio recorder) subprocess and reading PCM data from its output
+- **iOS** (`ios/Classes/`): Swift implementation using `AVAudioEngine` with an `AVAudioSinkNode` for buffer capture. `AudioCapture` manages only the engine — the host app owns the `AVAudioSession` (category, mode, activation) and must configure a record-capable one before `start()`
 
 ### Channel Names
-- Event channel: `ymd.dev/audio_capture_event_channel`
-- Method channel: `ymd.dev/audio_capture_method_channel`
+- Method channel: `ymd.dev/audio_capture_method_channel` (no event channel)
 
 ### Usage Pattern
 ```dart
@@ -45,9 +43,8 @@ await plugin.start(listener, onError, sampleRate: 16000, bufferSize: 3000);
 await plugin.stop();
 ```
 
-**Note**: `bufferSize` parameter only affects iOS. Android audio source can be configured via `androidAudioSource` parameter using constants like `ANDROID_AUDIOSRC_MIC`, `ANDROID_AUDIOSRC_VOICERECOGNITION`, etc.
+**Note**: Android audio source can be configured via `androidAudioSource` parameter using constants like `ANDROID_AUDIOSRC_MIC`, `ANDROID_AUDIOSRC_VOICERECOGNITION`, etc.
 
 ### Platform Permissions Required
 - **Android**: `RECORD_AUDIO` permission in AndroidManifest.xml
 - **iOS**: `NSMicrophoneUsageDescription` in Info.plist
-- **Linux**: `pulseaudio` package with `parec` utility

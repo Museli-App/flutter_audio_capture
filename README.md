@@ -1,7 +1,7 @@
 # flutter_audio_capture
 
 Capture the audio stream buffer through microphone for iOS/Android.
-Required OS version is iOS 13+ or Android 23+
+Required OS version is iOS 13+ or Android 24+
 
 ## Getting Started
 
@@ -63,13 +63,6 @@ Any equivalent native configuration (e.g. in your `AppDelegate`) works too.
 Without it the session stays in the default `.soloAmbient` category, which
 does not permit recording, and `start()` will report an error.
 
-### Linux
-
-On Linux, this package uses [`parec`](https://manpages.debian.org/testing/pulseaudio-utils/parec.1.en.html) to record audio.
-
-While things should just work on recent [Ubuntu versions](https://ubuntu.com/download/desktop),
-make sure to have `pulseaudio` installed on the target device.
-
 ## Example
 
 You can see full example in `example/lib/main.dart`
@@ -96,7 +89,7 @@ FlutterAudioCapture plugin = new FlutterAudioCapture();
 
 // Start to capture audio stream buffer
 // sampleRate: sample rate you want
-// bufferSize: buffer size you want (iOS only)
+// bufferSize: frames per delivered block
 await plugin.start(listener, onError, sampleRate: 16000, bufferSize: 3000);
 
 // Stop to capture audio stream buffer
