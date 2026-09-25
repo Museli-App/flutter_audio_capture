@@ -235,7 +235,7 @@ void main() {
     };
   }
 
-  test('facade delivers across a gap and reports it first', () async {
+  test('facade delivers across a gap', () async {
     final events = <String>[];
     final gapRead = Completer<void>();
     serveReads([
@@ -244,23 +244,11 @@ void main() {
     ]);
     final capture = FlutterAudioCapture();
     await capture.start((samples) {
-      events.add('samples ${samples.length}');
-      if (events.length == 3) gapRead.complete();
-    }, (Object error) => events.add('error $error'),
-        onDiscontinuity: () => events.add('gap'));
-    await gapRead.future;
-    expect(events, ['samples 2', 'gap', 'samples 2']);
-    await capture.stop();
-  });
-
-  test('facade without a gap callback still delivers the block', () async {
-    serveReads([
-      [block()]
-    ]);
-    final received = <Float32List>[];
-    final capture = FlutterAudioCapture();
-    await capture.start(received.add, (Object _) {});
-    expect(received.single, [0.25, -0.25]);
+      events.add('samples $samples');
+      if (events.length == 2) gapRead.complete();
+    }, (Object error) => events.add('error $error'));
+    await gapRead.future.timeout(const Duration(seconds: 2));
+    expect(events, ['samples [0.25, -0.25]', 'samples [0.25, -0.25]']);
     await capture.stop();
   });
 

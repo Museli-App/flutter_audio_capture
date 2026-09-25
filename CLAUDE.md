@@ -29,7 +29,7 @@ cd example && flutter run
 
 This is a Flutter federated plugin with platform-specific implementations communicating via Flutter platform channels:
 
-- **Dart API** (`lib/flutter_audio_capture.dart`): `CaptureSession` request/response reads over a `MethodChannel`, plus the `FlutterAudioCapture` compatibility facade
+- **Dart API** (`lib/flutter_audio_capture.dart`): `CaptureSession` request/response reads over a `MethodChannel` (the host app's matching path, pumped in its pitch worker), plus the `FlutterAudioCapture` compatibility facade (its tuner path)
 - **Android** (`android/src/main/kotlin/`): Kotlin implementation using `AudioRecord` API with a background thread for capturing. `AudioCaptureStreamHandler` handles the actual recording loop
 - **iOS** (`ios/Classes/`): Swift implementation using `AVAudioEngine` with an `AVAudioSinkNode` for buffer capture. `AudioCapture` manages only the engine — the host app owns the `AVAudioSession` (category, mode, activation) and must configure a record-capable one before `start()`
 

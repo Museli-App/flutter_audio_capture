@@ -155,7 +155,8 @@ class CaptureSession {
   }
 }
 
-/// Compatibility facade over [CaptureSession]; the flag-off production mic path.
+/// Compatibility facade over [CaptureSession] for tuner capture: Android DEFAULT
+/// source, no stall after first data. Matching should pump [CaptureSession].
 class FlutterAudioCapture {
   CaptureSession? _session;
   Future<void>? _starting;
@@ -163,7 +164,7 @@ class FlutterAudioCapture {
   double? _actualSampleRate;
   double? get actualSampleRate => _actualSampleRate;
 
-  /// Blocks after a gap are still delivered; [onDiscontinuity] runs first.
+  /// Blocks after a gap are still delivered, so the listener splices across it.
   Future<void> start(
     void Function(Float32List) listener,
     Function onError, {
@@ -171,14 +172,12 @@ class FlutterAudioCapture {
     int bufferSize = 512,
     int androidAudioSource = ANDROID_AUDIOSRC_DEFAULT,
     Duration firstDataTimeout = const Duration(seconds: 2),
-    void Function()? onDiscontinuity,
   }) {
     if (_starting != null) return _starting!;
     if (_session != null) return Future.value();
     final revision = ++_revision;
     void deliver(CaptureBlock block) {
       if (revision != _revision) return;
-      if (block.discontinuity) onDiscontinuity?.call();
       listener(block.samples);
     }
 
