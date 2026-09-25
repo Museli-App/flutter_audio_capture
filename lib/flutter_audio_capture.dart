@@ -59,6 +59,10 @@ class CaptureSession {
         bufferSize > 8192) {
       throw ArgumentError('Unsupported capture format');
     }
+    // Claim before the clock sync: native refuses this start, with no side
+    // effects, once a later open has claimed.
+    final owner = await _channel.invokeMethod<int>('claim');
+    if (owner == null) throw StateError('Native capture claim unavailable');
     // The lowest round trip gives the tightest offset.
     var bestRoundTrip = 1 << 62;
     var offset = 0;
@@ -79,6 +83,7 @@ class CaptureSession {
       'bufferSize': bufferSize,
       'audioSource': androidAudioSource,
       'clientId': clientId,
+      'owner': owner,
     });
     if (config == null) throw StateError('Capture did not start');
     return CaptureSession._(

@@ -6,10 +6,15 @@ final class AudioCaptureEventStreamHandler {
     private var queue: CaptureQueue?
     private var observers: [NSObjectProtocol] = []
     private var generation: Int64 = 0
+    private var claims = CaptureClaims()
     private var clientId: String?
     private var actualSampleRate: Double?
 
+    func claim() -> Int64 { claims.claim() }
+
     func start(_ args: [String: Any]) throws -> [String: Any] {
+        // Before any side effect: a superseded start must leave the current session running.
+        try claims.admit((args["owner"] as? NSNumber)?.int64Value)
         stop(nil)
         let frames = args["bufferSize"] as? Int ?? 512
         let rate = (args["sampleRate"] as? NSNumber)?.doubleValue ?? 44100

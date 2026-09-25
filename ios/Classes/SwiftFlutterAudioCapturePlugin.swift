@@ -15,6 +15,7 @@ public class SwiftFlutterAudioCapturePlugin: NSObject, FlutterPlugin {
         let args = call.arguments as? [String: Any] ?? [:]
         do {
             switch call.method {
+            case "claim": result(capture.claim())
             case "startCapture": result(try capture.start(args))
             case "readCapture": result(try capture.read(args))
             case "stopCapture":
@@ -23,6 +24,8 @@ public class SwiftFlutterAudioCapturePlugin: NSObject, FlutterPlugin {
             case "clock": result(AudioCaptureEventStreamHandler.clock())
             default: result(FlutterMethodNotImplemented)
             }
+        } catch is CaptureSuperseded {
+            result(FlutterError(code: "CAPTURE_SUPERSEDED", message: "Superseded by a newer capture claim", details: nil))
         } catch {
             result(FlutterError(code: "CAPTURE_FAILED", message: error.localizedDescription, details: nil))
         }

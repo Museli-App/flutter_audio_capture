@@ -11,10 +11,15 @@ import java.util.concurrent.atomic.AtomicLong
 
 internal class AudioCaptureStreamHandler(private val context: Context) {
     private val generations = AtomicLong()
+    private val claims = CaptureClaims()
     @Volatile private var session: Session? = null
 
-    fun start(rate: Int, blockSize: Int, source: Int?, clientId: String?): Map<String, Any> {
+    fun claim(): Long = claims.claim()
+
+    fun start(rate: Int, blockSize: Int, source: Int?, clientId: String?, owner: Long?): Map<String, Any> {
         require(rate in 8000..192000 && blockSize in 64..8192)
+        // Before any side effect: a superseded start must leave the current session running.
+        claims.admit(owner)
         stop(null)
         val minimum = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT)
         check(minimum > 0) { "Unsupported capture format ($minimum)" }

@@ -14,6 +14,14 @@ fun main() {
             check(selectCaptureSource(explicit, supported) == explicit)
         }
     }
+    // The open that claimed last wins; an unowned start claims afresh, so it fences the owner before it.
+    val claims = CaptureClaims()
+    val older = claims.claim()
+    val newer = claims.claim()
+    fun refused(owner: Long?) = try { claims.admit(owner); false } catch (_: CaptureSupersededException) { true }
+    check(refused(older) && !refused(newer) && !refused(newer))
+    check(!refused(null) && refused(newer))
+    check(!refused(claims.claim()))
     val queue = CaptureQueue(4, 2)
     val source = floatArrayOf(1f, 2f, 3f, 4f)
     queue.offer(source, 0, 10)
@@ -109,5 +117,5 @@ fun main() {
     producer.join(1000)
     check(!producer.isAlive && received == totalBlocks)
     concurrent.close()
-    println("Capture source selection, ownership, overflow, short/error reads and shutdown checks passed")
+    println("Capture source selection, claims, ownership, overflow, short/error reads and shutdown checks passed")
 }

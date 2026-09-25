@@ -27,6 +27,8 @@ void main() {
     calls = [];
     answer = (call) async {
       switch (call.method) {
+        case 'claim':
+          return 41;
         case 'clock':
           return 1000000000;
         case 'startCapture':
@@ -69,10 +71,24 @@ void main() {
     expect(blocks.single.sequence, 2);
     expect(blocks.single.discontinuity, isTrue);
     expect(session.inputId, 'builtin');
-    expect(calls.first.method, 'clock');
     await session.close();
     await session.close();
     expect(calls.where((c) => c.method == 'stopCapture').length, 1);
+  });
+
+  test('open claims before the clock sync and starts as that owner', () async {
+    final session = await CaptureSession.open();
+    expect(calls.take(2).map((c) => c.method), ['claim', 'clock']);
+    final start = calls.singleWhere((c) => c.method == 'startCapture');
+    expect((start.arguments as Map)['owner'], 41);
+    await session.close();
+  });
+
+  test('a missing claim reply never starts capture', () async {
+    final original = answer;
+    answer = (call) async => call.method == 'claim' ? null : original(call);
+    await expectLater(CaptureSession.open(), throwsStateError);
+    expect(calls.map((c) => c.method), ['claim']);
   });
 
   test('automatic source selection reports native configuration', () async {
@@ -288,6 +304,26 @@ void main() {
     expect(capture.actualSampleRate, isNull);
   });
 
+  test('facade stop during the claim closes the late session', () async {
+    final original = answer;
+    final claimed = Completer<Object?>();
+    answer = (call) => call.method == 'claim' ? claimed.future : original(call);
+    final capture = FlutterAudioCapture();
+    var delivered = 0;
+    final pending = capture.start((_) => delivered++, (Object _) {});
+    await Future<void>.delayed(Duration.zero);
+    expect(calls.map((c) => c.method), ['claim']);
+    final stopped = capture.stop();
+    claimed.complete(41);
+    await stopped;
+    await pending;
+    expect(calls.map((c) => c.method).where((m) => m != 'clock'),
+        ['claim', 'startCapture', 'stopCapture']);
+    expect((calls.last.arguments as Map)['generation'], 7);
+    expect(delivered, 0);
+    expect(capture.actualSampleRate, isNull);
+  });
+
   test('facade times out when no samples arrive and closes the session',
       () async {
     final original = answer;
@@ -325,5 +361,28 @@ void main() {
     expect(errors, isEmpty);
     await capture.stop();
     expect(calls.where((c) => c.method == 'stopCapture').length, 1);
+  });
+
+  test('a superseded start creates no session and stops no one', () async {
+    final original = answer;
+    answer = (call) async => call.method == 'startCapture'
+        ? throw PlatformException(code: 'CAPTURE_SUPERSEDED')
+        : original(call);
+    final superseded = throwsA(isA<PlatformException>()
+        .having((e) => e.code, 'code', 'CAPTURE_SUPERSEDED'));
+    await expectLater(CaptureSession.open(), superseded);
+    final capture = FlutterAudioCapture();
+    await expectLater(capture.start((_) {}, (Object _) {}), superseded);
+    await capture.stop();
+    expect(calls.map((c) => c.method).toSet(),
+        {'claim', 'clock', 'startCapture'});
+    // Nothing is held, so the next start opens afresh.
+    answer = original;
+    serveReads([
+      [block()]
+    ]);
+    await capture.start((_) {}, (Object _) {});
+    expect(calls.where((c) => c.method == 'startCapture').length, 3);
+    await capture.stop();
   });
 }

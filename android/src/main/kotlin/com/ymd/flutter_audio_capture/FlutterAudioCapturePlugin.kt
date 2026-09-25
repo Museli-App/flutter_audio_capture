@@ -19,13 +19,17 @@ class FlutterAudioCapturePlugin: FlutterPlugin, MethodChannel.MethodCallHandler 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
             when (call.method) {
+                "claim" -> result.success(capture.claim())
                 "startCapture" -> result.success(capture.start(call.argument<Int>("sampleRate") ?: 44100,
-                    call.argument<Int>("bufferSize") ?: 512, call.argument<Int>("audioSource"), call.argument<String>("clientId")))
+                    call.argument<Int>("bufferSize") ?: 512, call.argument<Int>("audioSource"), call.argument<String>("clientId"),
+                    call.argument<Number>("owner")?.toLong()))
                 "readCapture" -> result.success(capture.read(call.argument<Number>("generation")!!.toLong(), call.argument<Int>("maxBlocks") ?: 8))
                 "stopCapture" -> { capture.stop(call.argument<Number>("generation")?.toLong(), call.argument<String>("clientId")); result.success(null) }
                 "clock" -> result.success(System.nanoTime())
                 else -> result.notImplemented()
             }
+        } catch (error: CaptureSupersededException) {
+            result.error("CAPTURE_SUPERSEDED", error.message, null)
         } catch (error: Exception) {
             result.error("CAPTURE_FAILED", error.message, null)
         }

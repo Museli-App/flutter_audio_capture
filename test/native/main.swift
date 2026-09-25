@@ -33,6 +33,18 @@ do { _ = try failed.take(generation: 9, rate: 44100, maximum: 8); fatalError("Ex
 catch { precondition((error as NSError).code == 42) }
 print("Swift capture ownership, overflow, failure and shutdown checks passed")
 
+// The open that claimed last wins; an unowned start claims afresh, so it fences the owner before it.
+var claims = CaptureClaims()
+let older = claims.claim()
+let newer = claims.claim()
+func refused(_ owner: Int64?) -> Bool {
+    do { try claims.admit(owner); return false } catch { precondition(error is CaptureSuperseded); return true }
+}
+precondition(refused(older) && !refused(newer) && !refused(newer))
+precondition(!refused(nil) && refused(newer))
+precondition(!refused(claims.claim()))
+print("Swift capture claim checks passed")
+
 var clock = CaptureSampleClock(inputRate: 48000, outputRate: 44100)
 precondition(!clock.observe(inputFrame: 4800, hostNs: 1_000_000_000, outputFrame: 0))
 precondition(clock.time(outputFrame: 441) == 1_010_000_000)
