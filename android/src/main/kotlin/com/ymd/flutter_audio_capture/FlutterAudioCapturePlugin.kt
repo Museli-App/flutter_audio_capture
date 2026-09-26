@@ -6,11 +6,11 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.StandardMethodCodec
 
 class FlutterAudioCapturePlugin: FlutterPlugin, MethodChannel.MethodCallHandler {
-    private lateinit var capture: AudioCaptureStreamHandler
+    private lateinit var capture: CaptureController
     private var channel: MethodChannel? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        capture = AudioCaptureStreamHandler(binding.applicationContext)
+        capture = CaptureController(binding.applicationContext)
         channel = MethodChannel(binding.binaryMessenger, "ymd.dev/audio_capture_method_channel",
             StandardMethodCodec.INSTANCE, binding.binaryMessenger.makeBackgroundTaskQueue())
         channel!!.setMethodCallHandler(this)
@@ -22,7 +22,7 @@ class FlutterAudioCapturePlugin: FlutterPlugin, MethodChannel.MethodCallHandler 
                 "claim" -> result.success(capture.claim())
                 "startCapture" -> result.success(capture.start(call.argument<Int>("sampleRate") ?: 44100,
                     call.argument<Int>("bufferSize") ?: 512, call.argument<Int>("audioSource"), call.argument<String>("clientId"),
-                    call.argument<Number>("owner")?.toLong()))
+                    requireNotNull(call.argument<Number>("owner")) { "Missing capture owner" }.toLong()))
                 "readCapture" -> result.success(capture.read(call.argument<Number>("generation")!!.toLong(), call.argument<Int>("maxBlocks") ?: 8))
                 "stopCapture" -> { capture.stop(call.argument<Number>("generation")?.toLong(), call.argument<String>("clientId")); result.success(null) }
                 "clock" -> result.success(System.nanoTime())

@@ -166,8 +166,6 @@ class FlutterAudioCapture {
   CaptureSession? _session;
   Future<void>? _starting;
   var _revision = 0;
-  double? _actualSampleRate;
-  double? get actualSampleRate => _actualSampleRate;
 
   /// Blocks after a gap are still delivered, so the listener splices across it.
   Future<void> start(
@@ -216,10 +214,7 @@ class FlutterAudioCapture {
     // No stall: after first data it waits through silence, as before.
     final first = Completer<void>();
     unawaited(session.pump((blocks) {
-      if (!first.isCompleted) {
-        _actualSampleRate = session.sampleRate.toDouble();
-        first.complete();
-      }
+      if (!first.isCompleted) first.complete();
       blocks.forEach(deliver);
     }).then((_) {
       if (!first.isCompleted) first.complete();
@@ -263,6 +258,5 @@ class FlutterAudioCapture {
         await pending;
       } catch (_) {}
     }
-    _actualSampleRate = null;
   }
 }

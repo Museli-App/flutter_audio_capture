@@ -14,14 +14,13 @@ fun main() {
             check(selectCaptureSource(explicit, supported) == explicit)
         }
     }
-    // The open that claimed last wins; an unowned start claims afresh, so it fences the owner before it.
+    // The open that claimed last wins: only the newest claim's start is admitted.
     val claims = CaptureClaims()
     val older = claims.claim()
     val newer = claims.claim()
-    fun refused(owner: Long?) = try { claims.admit(owner); false } catch (_: CaptureSupersededException) { true }
+    fun refused(owner: Long) = try { claims.admit(owner); false } catch (_: CaptureSupersededException) { true }
     check(refused(older) && !refused(newer) && !refused(newer))
-    check(!refused(null) && refused(newer))
-    check(!refused(claims.claim()))
+    check(!refused(claims.claim()) && refused(newer))
     val queue = CaptureQueue(4, 2)
     val source = floatArrayOf(1f, 2f, 3f, 4f)
     queue.offer(source, 0, 10)

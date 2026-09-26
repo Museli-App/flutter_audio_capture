@@ -2,7 +2,7 @@ import Flutter
 import UIKit
 
 public class SwiftFlutterAudioCapturePlugin: NSObject, FlutterPlugin {
-    private let capture = AudioCaptureEventStreamHandler()
+    private let capture = CaptureController()
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "ymd.dev/audio_capture_method_channel",
@@ -21,7 +21,7 @@ public class SwiftFlutterAudioCapturePlugin: NSObject, FlutterPlugin {
             case "stopCapture":
                 capture.stop((args["generation"] as? NSNumber)?.int64Value, clientId: args["clientId"] as? String)
                 result(nil)
-            case "clock": result(AudioCaptureEventStreamHandler.clock())
+            case "clock": result(CaptureController.clock())
             default: result(FlutterMethodNotImplemented)
             }
         } catch is CaptureSuperseded {

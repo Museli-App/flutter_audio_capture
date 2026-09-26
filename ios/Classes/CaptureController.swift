@@ -1,7 +1,7 @@
 import AVFoundation
 import Flutter
 
-final class AudioCaptureEventStreamHandler {
+final class CaptureController {
     private let audioCapture = AudioCapture()
     private var queue: CaptureQueue?
     private var observers: [NSObjectProtocol] = []
@@ -14,7 +14,8 @@ final class AudioCaptureEventStreamHandler {
 
     func start(_ args: [String: Any]) throws -> [String: Any] {
         // Before any side effect: a superseded start must leave the current session running.
-        try claims.admit((args["owner"] as? NSNumber)?.int64Value)
+        guard let owner = (args["owner"] as? NSNumber)?.int64Value else { throw failure("Missing capture owner") }
+        try claims.admit(owner)
         stop(nil)
         let frames = args["bufferSize"] as? Int ?? 512
         let rate = (args["sampleRate"] as? NSNumber)?.doubleValue ?? 44100

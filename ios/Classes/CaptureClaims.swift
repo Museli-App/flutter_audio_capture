@@ -10,12 +10,8 @@ struct CaptureClaims {
         return latest
     }
 
-    /// Refuses a stale owner; an unowned (legacy) start claims afresh, so it still fences older owned starts.
-    mutating func admit(_ owner: Int64?) throws {
-        guard let owner = owner else {
-            latest += 1
-            return
-        }
+    /// Refuses every owner but the newest claim's.
+    func admit(_ owner: Int64) throws {
         guard owner == latest else { throw CaptureSuperseded() }
     }
 }

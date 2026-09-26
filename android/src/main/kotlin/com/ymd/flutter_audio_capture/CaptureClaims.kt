@@ -11,8 +11,8 @@ internal class CaptureClaims {
 
     fun claim(): Long = latest.incrementAndGet()
 
-    /** Refuses a stale owner; an unowned (legacy) start claims afresh, so it still fences older owned starts. */
-    fun admit(owner: Long?) {
-        if (owner == null) latest.incrementAndGet() else if (owner != latest.get()) throw CaptureSupersededException()
+    /** Refuses every owner but the newest claim's. */
+    fun admit(owner: Long) {
+        if (owner != latest.get()) throw CaptureSupersededException()
     }
 }

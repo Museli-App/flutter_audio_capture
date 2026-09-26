@@ -279,9 +279,7 @@ void main() {
     await first;
     final start = calls.singleWhere((call) => call.method == 'startCapture');
     expect((start.arguments as Map)['audioSource'], ANDROID_AUDIOSRC_DEFAULT);
-    expect(capture.actualSampleRate, 44100);
     await capture.stop();
-    expect(capture.actualSampleRate, isNull);
   });
 
   test('facade stop during the first-data wait closes the session', () async {
@@ -301,7 +299,6 @@ void main() {
     await stopped;
     await pending;
     expect(calls.where((c) => c.method == 'stopCapture').length, 1);
-    expect(capture.actualSampleRate, isNull);
   });
 
   test('facade stop during the claim closes the late session', () async {
@@ -321,7 +318,6 @@ void main() {
         ['claim', 'startCapture', 'stopCapture']);
     expect((calls.last.arguments as Map)['generation'], 7);
     expect(delivered, 0);
-    expect(capture.actualSampleRate, isNull);
   });
 
   test('facade times out when no samples arrive and closes the session',
