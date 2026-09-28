@@ -43,7 +43,7 @@ If you want to use this package on iOS, you need to set `NSMicrophoneUsageDescri
 ```
 
 The plugin does not configure the audio session itself, so your app must
-activate a record-capable `AVAudioSession` before calling `start()`. The
+activate a record-capable `AVAudioSession` before calling `CaptureSession.open()`. The
 easiest way from Dart is the
 [`audio_session`](https://pub.dev/packages/audio_session) package:
 
@@ -61,7 +61,7 @@ await session.setActive(true);
 
 Any equivalent native configuration (e.g. in your `AppDelegate`) works too.
 Without it the session stays in the default `.soloAmbient` category, which
-does not permit recording, and `start()` will report an error.
+does not permit recording, and `open()` will report an error.
 
 ## Example
 
@@ -71,27 +71,15 @@ You can see full example in `example/lib/main.dart`
 import 'package:flutter_audio_capture/flutter_audio_capture.dart';
 ...
 
-// Callback function if device capture new audio stream.
-// argument is audio stream buffer captured through microphone.
-void listener(Float32List buffer) {
-  print(buffer);
-}
+// Start capturing; bufferSize is the frames per delivered block.
+final session = await CaptureSession.open(sampleRate: 16000, bufferSize: 3000);
 
-// Callback function if flutter_audio_capture failure to register
-// audio capture stream subscription.
-void onError(Object e) {
-  print(e);
-}
+// Deliver each batch of timestamped blocks until closed. A gap still
+// delivers, with `discontinuity` set; the first error ends the pump.
+session.pump((blocks) {
+  for (final block in blocks) print(block.samples);
+}).catchError((Object e) => print(e));
 
-...
-
-FlutterAudioCapture plugin = new FlutterAudioCapture();
-
-// Start to capture audio stream buffer
-// sampleRate: sample rate you want
-// bufferSize: frames per delivered block
-await plugin.start(listener, onError, sampleRate: 16000, bufferSize: 3000);
-
-// Stop to capture audio stream buffer
-await plugin.stop();
+// Stop capturing
+await session.close();
 ```

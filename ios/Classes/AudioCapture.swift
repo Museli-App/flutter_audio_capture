@@ -7,16 +7,29 @@ public class AudioCapture {
     private var pipeline: CapturePipeline?
 
     func startSession(bufferSize: UInt32, sampleRate: Double, queue: CaptureQueue) throws {
+        try start(frames: Int(bufferSize), rate: sampleRate, queue: queue, from: 0)
+    }
+
+    /// Rebuilds on the routed input, whose format may have changed; positions carry on.
+    func restart(queue: CaptureQueue) throws {
+        guard let old = pipeline else { throw captureError("Capture stopped") }
+        stopSession() // first, so the old worker's last block is counted
+        try start(frames: old.frames, rate: old.rate, queue: queue, from: old.emitted)
+    }
+
+    private func start(frames: Int, rate: Double, queue: CaptureQueue, from emitted: Int64) throws {
         stopSession()
         let input = audioEngine.inputNode
         let format = input.outputFormat(forBus: 0)
-        let pipeline = try CapturePipeline(format: format, frames: Int(bufferSize), rate: sampleRate, queue: queue)
+        let pipeline = try CapturePipeline(format: format, frames: frames, rate: rate, queue: queue, from: emitted)
+        // Only the C ring crosses into the real-time block: no Swift object to retain there.
+        let ring = pipeline.ring
         let sink = AVAudioSinkNode { timestamp, frames, buffers in
             let stamp = timestamp.pointee
             let valid = stamp.mFlags.contains(.hostTimeValid) && stamp.mFlags.contains(.sampleTimeValid)
                 && stamp.mSampleTime.isFinite && stamp.mSampleTime >= Double(Int64.min)
                 && stamp.mSampleTime < Double(Int64.max)
-            CaptureInputRingOffer(pipeline.ring, buffers, frames,
+            CaptureInputRingOffer(ring, buffers, frames,
                 valid ? Int64(stamp.mSampleTime) : 0, stamp.mHostTime, valid)
             return noErr
         }
@@ -53,7 +66,8 @@ final class CapturePipeline {
     private let input: AVAudioPCMBuffer
     private let converted: AVAudioPCMBuffer
     private let converter: AVAudioConverter?
-    private let frames: Int
+    let frames: Int
+    let rate: Double
     private let pending: UnsafeMutablePointer<Float>
     private let queue: CaptureQueue
     private var clock: CaptureSampleClock
@@ -61,10 +75,13 @@ final class CapturePipeline {
     private(set) var emitted: Int64 = 0
     private var nextInputSample: Int64?
     private var gap = false
+    // Half the last packet: most wakeups found the ring empty at a fixed 2 ms.
+    private var idleWait = 0.002
     private var worker: Thread?
     private let finished = DispatchGroup()
 
-    init(format: AVAudioFormat, frames: Int, rate: Double, queue: CaptureQueue) throws {
+    /// A pipeline continuing from [emitted] frames marks its first block discontinuous.
+    init(format: AVAudioFormat, frames: Int, rate: Double, queue: CaptureQueue, from emitted: Int64 = 0) throws {
         let maximumFrames: AVAudioFrameCount = 16384
         guard format.sampleRate > 0, format.channelCount > 0, format.channelCount <= 8,
               format.commonFormat == .pcmFormatFloat32, frames > 0, rate > 0,
@@ -73,22 +90,25 @@ final class CapturePipeline {
               let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: maximumFrames),
               let converted = AVAudioPCMBuffer(pcmFormat: output,
                 frameCapacity: AVAudioFrameCount(ceil(Double(maximumFrames) * rate / format.sampleRate)) + 4096)
-        else { throw Self.failure("Invalid capture format or buffer allocation") }
+        else { throw captureError("Invalid capture format or buffer allocation") }
         let conversionNeeded = format.sampleRate != rate || format.channelCount != 1 || format.isInterleaved
         let converter = conversionNeeded ? AVAudioConverter(from: format, to: output) : nil
-        guard !conversionNeeded || converter != nil else { throw Self.failure("Cannot create converter") }
+        guard !conversionNeeded || converter != nil else { throw captureError("Cannot create converter") }
         converter?.sampleRateConverterQuality = AVAudioQuality.high.rawValue
         let planes = format.isInterleaved ? 1 : format.channelCount
         guard let ring = CaptureInputRingCreate(32, maximumFrames, planes,
             format.streamDescription.pointee.mBytesPerFrame) else {
-            throw Self.failure("Cannot allocate lock-free capture storage")
+            throw captureError("Cannot allocate lock-free capture storage")
         }
         self.ring = ring
         self.input = input
         self.converted = converted
         self.converter = converter
         self.frames = frames
+        self.rate = rate
         self.queue = queue
+        self.emitted = emitted
+        gap = emitted > 0
         clock = CaptureSampleClock(inputRate: format.sampleRate, outputRate: rate)
         pending = .allocate(capacity: frames)
         pending.initialize(repeating: 0, count: frames)
@@ -114,7 +134,7 @@ final class CapturePipeline {
     private func run() {
         do {
             while !CaptureInputRingIsClosed(ring) {
-                if try !drainOnce() { Thread.sleep(forTimeInterval: 0.002) }
+                if try !drainOnce() { Thread.sleep(forTimeInterval: idleWait) }
             }
         } catch { queue.close(error) }
     }
@@ -125,9 +145,10 @@ final class CapturePipeline {
         input.frameLength = input.frameCapacity
         guard CaptureInputRingRead(ring, input.mutableAudioBufferList, &packet) else {
             let error = CaptureInputRingError(ring)
-            if error != 0 { throw Self.failure("Input callback failed (\(error))") }
+            if error != 0 { throw captureError("Input callback failed (\(error))") }
             return false
         }
+        idleWait = max(0.002, Double(packet.frameCount) / clock.inputRate / 2)
         input.frameLength = packet.frameCount
         try process(packet)
         return true
@@ -155,10 +176,10 @@ final class CapturePipeline {
                 return input
             }
             if let error = error { throw error }
-            guard status != .error else { throw Self.failure("Audio conversion failed") }
+            guard status != .error else { throw captureError("Audio conversion failed") }
             pcm = converted
         } else { pcm = input }
-        guard let samples = pcm.floatChannelData?[0] else { throw Self.failure("Expected Float32 input") }
+        guard let samples = pcm.floatChannelData?[0] else { throw captureError("Expected Float32 input") }
         var cursor = 0
         while cursor < Int(pcm.frameLength) {
             let count = min(frames - filled, Int(pcm.frameLength) - cursor)
@@ -171,10 +192,6 @@ final class CapturePipeline {
             filled = 0
             gap = false
         }
-    }
-
-    private static func failure(_ message: String) -> NSError {
-        NSError(domain: "AudioCapture", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     deinit {

@@ -29,18 +29,18 @@ cd example && flutter run
 
 This is a Flutter federated plugin with platform-specific implementations communicating via Flutter platform channels:
 
-- **Dart API** (`lib/flutter_audio_capture.dart`): `CaptureSession` request/response reads over a `MethodChannel` (the host app's matching path, pumped in its pitch worker), plus the `FlutterAudioCapture` compatibility facade (its tuner path)
+- **Dart API** (`lib/flutter_audio_capture.dart`): `CaptureSession` request/response reads over a `MethodChannel`, pumped by the host app's pitch worker, latency probe and tuner
 - **Android** (`android/src/main/kotlin/`): Kotlin implementation using `AudioRecord` API with a background thread for capturing. `CaptureController` owns the capture worker; `Session.record` + `CaptureBlockReader` are the recording loop
-- **iOS** (`ios/Classes/`): Swift implementation using `AVAudioEngine` with an `AVAudioSinkNode` for buffer capture. `AudioCapture` manages only the engine — the host app owns the `AVAudioSession` (category, mode, activation) and must configure a record-capable one before `start()`
+- **iOS** (`ios/Classes/`): Swift implementation using `AVAudioEngine` with an `AVAudioSinkNode` for buffer capture. `AudioCapture` manages only the engine — the host app owns the `AVAudioSession` (category, mode, activation) and must configure a record-capable one before `CaptureSession.open()`
 
 ### Channel Names
 - Method channel: `ymd.dev/audio_capture_method_channel` (no event channel)
 
 ### Usage Pattern
 ```dart
-FlutterAudioCapture plugin = FlutterAudioCapture();
-await plugin.start(listener, onError, sampleRate: 16000, bufferSize: 3000);
-await plugin.stop();
+final session = await CaptureSession.open(sampleRate: 16000, bufferSize: 3000);
+session.pump((blocks) => blocks.forEach(handle)).catchError(onError);
+await session.close();
 ```
 
 **Note**: Android audio source can be configured via `androidAudioSource` parameter using constants like `ANDROID_AUDIOSRC_MIC`, `ANDROID_AUDIOSRC_VOICERECOGNITION`, etc.

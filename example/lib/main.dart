@@ -13,11 +13,12 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  FlutterAudioCapture _plugin = new FlutterAudioCapture();
+  CaptureSession? _session;
 
   Future<void> _startCapture() async {
+    if (_session != null) return;
     // The plugin does not configure the audio session; the app must activate a
-    // record-capable one before start().
+    // record-capable one before open().
     final session = await AudioSession.instance;
     await session.configure(AudioSessionConfiguration(
       avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
@@ -25,11 +26,18 @@ class _MyAppState extends State<MyApp> {
       avAudioSessionMode: AVAudioSessionMode.measurement,
     ));
     await session.setActive(true);
-    await _plugin.start(listener, onError, sampleRate: 16000, bufferSize: 3000);
+    final capture = _session =
+        await CaptureSession.open(sampleRate: 16000, bufferSize: 3000);
+    // Pumps until closed; a gap still delivers, flagged discontinuous.
+    capture
+        .pump((blocks) => blocks.forEach((block) => listener(block.samples)))
+        .catchError(onError);
   }
 
   Future<void> _stopCapture() async {
-    await _plugin.stop();
+    final capture = _session;
+    _session = null;
+    await capture?.close();
   }
 
   void listener(Float32List buffer) {

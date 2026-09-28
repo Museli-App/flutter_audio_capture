@@ -2,64 +2,98 @@ import AVFoundation
 import Flutter
 
 final class CaptureController {
+    // Recursive, as start stops first. Channel calls arrive on one task queue; detach and rebuilds do not.
+    private let lock = NSRecursiveLock()
+    private let rebuilds = DispatchQueue(label: "museli.capture.rebuild")
     private let audioCapture = AudioCapture()
     private var queue: CaptureQueue?
     private var observers: [NSObjectProtocol] = []
     private var generation: Int64 = 0
     private var claims = CaptureClaims()
     private var clientId: String?
-    private var actualSampleRate: Double?
+    private var inputUid: String?
 
-    func claim() -> Int64 { claims.claim() }
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
+    func claim() -> Int64 { locked { claims.claim() } }
 
     func start(_ args: [String: Any]) throws -> [String: Any] {
-        // Before any side effect: a superseded start must leave the current session running.
-        guard let owner = (args["owner"] as? NSNumber)?.int64Value else { throw failure("Missing capture owner") }
-        try claims.admit(owner)
-        stop(nil)
-        let frames = args["bufferSize"] as? Int ?? 512
-        let rate = (args["sampleRate"] as? NSNumber)?.doubleValue ?? 44100
-        guard (64...8192).contains(frames), (8000...192000).contains(rate) else {
-            throw failure("Invalid capture format")
-        }
-        // The host prefers the built-in mic; any routed input records, as before timestamps.
-        guard let input = AVAudioSession.sharedInstance().currentRoute.inputs.first else { throw failure("No audio input") }
-        generation += 1
-        clientId = args["clientId"] as? String
-        let next = CaptureQueue(frames: frames, capacity: CaptureQueue.capacity(sampleRate: rate, frames: frames))
-        queue = next
-        observeRoute(next, inputUid: input.uid)
-        do {
-            try audioCapture.startSession(bufferSize: UInt32(frames), sampleRate: rate, queue: next)
-            observeEngine(next)
-            actualSampleRate = rate
-            return ["generation": generation, "sampleRate": rate, "inputId": input.uid]
-        } catch {
-            next.close(error)
-            queue = nil
-            removeObservers()
-            throw error
+        try locked {
+            // Before any side effect: a superseded start must leave the current session running.
+            guard let owner = (args["owner"] as? NSNumber)?.int64Value else {
+                throw captureError("Missing capture owner")
+            }
+            try claims.admit(owner)
+            stop(nil)
+            let frames = args["bufferSize"] as? Int ?? 512
+            let rate = (args["sampleRate"] as? NSNumber)?.doubleValue ?? 44100
+            guard (64...8192).contains(frames), (8000...192000).contains(rate) else {
+                throw captureError("Invalid capture format")
+            }
+            // The host prefers the built-in mic; any routed input records, as before timestamps.
+            guard let input = AVAudioSession.sharedInstance().currentRoute.inputs.first else {
+                throw captureError("No audio input")
+            }
+            generation += 1
+            clientId = args["clientId"] as? String
+            inputUid = input.uid
+            let next = CaptureQueue(frames: frames, capacity: CaptureQueue.capacity(sampleRate: rate, frames: frames))
+            queue = next
+            observeRoute(generation)
+            do {
+                try audioCapture.startSession(bufferSize: UInt32(frames), sampleRate: rate, queue: next)
+                observeEngine(generation)
+                return ["generation": generation, "sampleRate": rate]
+            } catch {
+                next.close(error)
+                queue = nil
+                removeObservers()
+                throw error
+            }
         }
     }
 
-    // Output-only and category changes keep the mic.
-    private func observeRoute(_ next: CaptureQueue, inputUid: String) {
+    // Output-only and category changes keep the mic; an input change rebuilds.
+    private func observeRoute(_ token: Int64) {
         observers = [
-            NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { _ in
-                guard AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid != inputUid else { return }
-                next.close(Self.invalidated("Audio input changed; restart capture"))
-            },
+            NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
+                queue: nil) { [weak self] _ in self?.scheduleRebuild(token) },
         ]
     }
 
-    // After start, so the app's pre-start session setup can't close it; a real reconfiguration stops the engine first.
-    private func observeEngine(_ next: CaptureQueue) {
-        let engine = audioCapture.audioEngine
+    // After start, so the app's pre-start session setup can't trigger it; a real reconfiguration stops the engine.
+    private func observeEngine(_ token: Int64) {
         observers.append(NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-            object: engine, queue: nil) { _ in
-            guard !engine.isRunning else { return }
-            next.close(Self.invalidated("Audio engine reconfigured; restart capture"))
-        })
+            object: audioCapture.audioEngine, queue: nil) { [weak self] _ in self?.scheduleRebuild(token) })
+    }
+
+    // Off the notifying thread, so the engine never restarts inside its own notification.
+    private func scheduleRebuild(_ token: Int64) {
+        rebuilds.async { [weak self] in self?.rebuild(token) }
+    }
+
+    /// Keeps capturing through an input change or engine reconfiguration, as Android does, and marks
+    /// the next block discontinuous. One change fires both notifications, so the second finds nothing.
+    private func rebuild(_ token: Int64) {
+        locked {
+            guard token == generation, let current = queue else { return }
+            let uid = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
+            guard uid != inputUid || !audioCapture.audioEngine.isRunning else { return }
+            do {
+                guard let uid = uid else { throw captureError("No audio input") }
+                try audioCapture.restart(queue: current)
+                inputUid = uid
+            } catch {
+                // Only a failed rebuild ends capture; the next read reports it.
+                current.close(error)
+                audioCapture.stopSession()
+                removeObservers()
+            }
+        }
     }
 
     private func removeObservers() {
@@ -67,36 +101,31 @@ final class CaptureController {
         observers = []
     }
 
-    private static func invalidated(_ message: String) -> NSError {
-        NSError(domain: "AudioCapture", code: -2, userInfo: [NSLocalizedDescriptionKey: message])
-    }
-
     func read(_ args: [String: Any]) throws -> [[String: Any]] {
-        guard let queue = queue, let rate = actualSampleRate,
-              (args["generation"] as? NSNumber)?.int64Value == generation else {
-            throw failure("Stale or stopped capture")
+        let current: CaptureQueue = try locked {
+            guard let queue = queue, (args["generation"] as? NSNumber)?.int64Value == generation else {
+                throw captureError("Stale or stopped capture")
+            }
+            return queue
         }
-        return try queue.take(generation: generation, rate: rate, maximum: args["maxBlocks"] as? Int ?? 8).map { block in
-            ["generation": block.generation, "sequence": block.sequence, "firstFrame": block.firstFrame,
-             "captureTimeNs": block.captureTimeNs,
-             "discontinuity": block.discontinuity, "sampleRate": block.sampleRate, "frameCount": block.frameCount,
-             "audioData": FlutterStandardTypedData(float32: block.audioData)]
+        // Waits unlocked, so a detach or rebuild never queues behind an idle read.
+        return try current.take().map { block in
+            ["sequence": block.sequence, "firstFrame": block.firstFrame, "captureTimeNs": block.captureTimeNs,
+             "discontinuity": block.discontinuity, "audioData": FlutterStandardTypedData(float32: block.audioData)]
         }
     }
 
     func stop(_ token: Int64?, clientId: String? = nil) {
-        if let id = clientId, id != self.clientId { return }
-        if let token = token, token != generation { return }
-        removeObservers()
-        guard let old = queue else { return }
-        queue = nil
-        old.close()
-        audioCapture.stopSession()
-        actualSampleRate = nil
+        locked {
+            if let id = clientId, id != self.clientId { return }
+            if let token = token, token != generation { return }
+            removeObservers()
+            guard let old = queue else { return }
+            queue = nil
+            old.close()
+            audioCapture.stopSession()
+        }
     }
 
     static func clock() -> Int64 { CaptureSampleClock.hostNs(mach_absolute_time()) }
-    private func failure(_ message: String) -> NSError {
-        NSError(domain: "AudioCapture", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
-    }
 }

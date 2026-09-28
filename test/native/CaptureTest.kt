@@ -25,22 +25,26 @@ fun main() {
     val source = floatArrayOf(1f, 2f, 3f, 4f)
     queue.offer(source, 0, 10)
     source.fill(99f)
-    val first = queue.take(1, 44100, 8).single()
-    check((first["audioData"] as FloatArray).contentEquals(floatArrayOf(1f, 2f, 3f, 4f)))
+    val first = queue.take().single()
+    check(first.samples.contentEquals(floatArrayOf(1f, 2f, 3f, 4f)))
     queue.offer(source, 4, 20)
     queue.offer(source, 8, 30)
     queue.offer(source, 12, 40)
-    val overflow = queue.take(1, 44100, 8).single()
-    check(overflow["discontinuity"] == true && overflow["firstFrame"] == 12L)
-    check((first["audioData"] as FloatArray)[0] == 1f)
+    val overflow = queue.take().single()
+    check(overflow.discontinuity && overflow.firstFrame == 12L)
+    check(first.samples[0] == 1f)
     // A marked gap (input route change) reaches exactly the next offered block.
     val routed = CaptureQueue(4, 8)
     routed.offer(source, 0, 10)
     routed.markGap()
-    check(routed.take(1, 44100, 8).single()["discontinuity"] == false)
+    check(!routed.take().single().discontinuity)
     routed.offer(source, 4, 20)
     routed.offer(source, 8, 30)
-    check(routed.take(1, 44100, 8).map { it["discontinuity"] } == listOf(true, false))
+    check(routed.take().map { it.discontinuity } == listOf(true, false))
+    // A read takes at most MAX_TAKE blocks.
+    val many = CaptureQueue(4, 32)
+    repeat(10) { many.offer(source, it * 4L, it.toLong()) }
+    check(many.take().size == CaptureQueue.MAX_TAKE && many.take().size == 2)
 
     val outputs = mutableListOf<FloatArray>()
     var next = 0
@@ -79,13 +83,13 @@ fun main() {
     check(!worker.isAlive)
     val waitingQueue = CaptureQueue(4, 32)
     val stopped = CountDownLatch(1)
-    val consumer = Thread { check(waitingQueue.take(1, 44100, 8).isEmpty()); stopped.countDown() }
+    val consumer = Thread { check(waitingQueue.take().isEmpty()); stopped.countDown() }
     consumer.start()
     waitingQueue.close()
     check(stopped.await(1, TimeUnit.SECONDS))
     val failureQueue = CaptureQueue(4, 32)
     failureQueue.close(IllegalStateException("native failure"))
-    try { failureQueue.take(1, 44100, 8); error("Expected queue failure") }
+    try { failureQueue.take(); error("Expected queue failure") }
     catch (failure: IllegalStateException) { check(failure.message == "native failure") }
     // Capacity exceeds the entire run, so lock contention must never drop PCM.
     val totalBlocks = 10000
@@ -105,11 +109,11 @@ fun main() {
     var received = 0
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
     while (received < totalBlocks && System.nanoTime() < deadline) {
-        for (packet in concurrent.take(1, 44100, 8)) {
-            check(packet["sequence"] == received.toLong()) { "Capture dropped a block during read contention" }
-            check(packet["firstFrame"] == received * 4L)
-            check(packet["discontinuity"] == false)
-            check((packet["audioData"] as FloatArray).all { it == received.toFloat() })
+        for (packet in concurrent.take()) {
+            check(packet.sequence == received.toLong()) { "Capture dropped a block during read contention" }
+            check(packet.firstFrame == received * 4L)
+            check(!packet.discontinuity)
+            check(packet.samples.all { it == received.toFloat() })
             received++
         }
     }

@@ -12,10 +12,12 @@ import java.util.concurrent.atomic.AtomicLong
 internal class CaptureController(private val context: Context) {
     private val generations = AtomicLong()
     private val claims = CaptureClaims()
-    @Volatile private var session: Session? = null
+    private var session: Session? = null
 
     fun claim(): Long = claims.claim()
 
+    // Synchronized, as engine detach calls stop off the channel's serial task queue.
+    @Synchronized
     fun start(rate: Int, blockSize: Int, source: Int?, clientId: String?, owner: Long): Map<String, Any> {
         require(rate in 8000..192000 && blockSize in 64..8192)
         // Before any side effect: a superseded start must leave the current session running.
@@ -35,28 +37,30 @@ internal class CaptureController(private val context: Context) {
             val mic = manager.getDevices(AudioManager.GET_DEVICES_INPUTS)
                 .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
             // Best effort, as before timestamped capture: without the built-in mic, record the default route.
-            val preferred = if (mic != null && recorder.setPreferredDevice(mic)) mic.id else -1
+            if (mic != null) recorder.setPreferredDevice(mic)
             recorder.startRecording()
             check(recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "AudioRecord did not start" }
-            // A preference is not a route; report the routed input once recording has one.
-            val inputId = recorder.routedDevice?.id ?: preferred
             val current = Session(generations.incrementAndGet(), recorder, blockSize, clientId)
             session = current
             current.thread.start()
-            return mapOf("generation" to current.generation, "sampleRate" to recorder.sampleRate,
-                "inputId" to inputId.toString(), "audioSource" to recorder.audioSource)
+            return mapOf("generation" to current.generation, "sampleRate" to recorder.sampleRate)
         } catch (error: Throwable) {
             recorder.release()
             throw error
         }
     }
 
-    fun read(generation: Long, maxBlocks: Int): List<Map<String, Any>> {
-        val current = session ?: error("Capture stopped")
+    fun read(generation: Long): List<Map<String, Any>> {
+        val current = synchronized(this) { session } ?: error("Capture stopped")
         check(current.generation == generation) { "Stale capture generation" }
-        return current.queue.take(generation, current.sampleRate, maxBlocks.coerceIn(1, 8))
+        // Waits unlocked, so a detach never queues behind an idle read; rows are built off the queue's lock.
+        return current.queue.take().map { block ->
+            mapOf("sequence" to block.sequence, "firstFrame" to block.firstFrame, "captureTimeNs" to block.timeNs,
+                "discontinuity" to block.discontinuity, "audioData" to block.samples)
+        }
     }
 
+    @Synchronized
     fun stop(generation: Long?, clientId: String? = null) {
         val current = session ?: return
         if (generation != null && generation != current.generation) return

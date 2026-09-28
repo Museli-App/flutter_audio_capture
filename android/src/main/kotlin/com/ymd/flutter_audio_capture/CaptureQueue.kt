@@ -10,7 +10,14 @@ internal class CaptureQueue(private val framesPerBlock: Int, capacity: Int) {
         /** About two seconds of blocks, so a UI-isolate stall does not overflow. */
         fun capacity(sampleRate: Int, framesPerBlock: Int) =
             maxOf(32, ceil(2.0 * sampleRate / framesPerBlock).toInt())
+
+        /** Blocks per read. */
+        const val MAX_TAKE = 8
     }
+
+    /** One delivered block; its samples are a copy the queue never reuses. */
+    class Block(val samples: FloatArray, val sequence: Long, val firstFrame: Long, val timeNs: Long,
+        val discontinuity: Boolean)
 
     private val lock = ReentrantLock()
     private val available = lock.newCondition()
@@ -50,19 +57,14 @@ internal class CaptureQueue(private val framesPerBlock: Int, capacity: Int) {
         } finally { lock.unlock() }
     }
 
-    fun take(generation: Long, rate: Int, maxBlocks: Int): List<Map<String, Any>> = lock.withLock {
+    fun take(): List<Block> = lock.withLock {
         var remaining = 250_000_000L
         while (size == 0 && !closed && remaining > 0) remaining = available.awaitNanos(remaining)
         failure?.let { throw it }
-        val result = ArrayList<Map<String, Any>>()
-        repeat(minOf(size, maxBlocks)) {
+        val result = ArrayList<Block>(minOf(size, MAX_TAKE))
+        repeat(minOf(size, MAX_TAKE)) {
             val index = read
-            result.add(mapOf(
-                "generation" to generation, "sequence" to sequences[index],
-                "firstFrame" to positions[index], "captureTimeNs" to times[index],
-                "discontinuity" to gaps[index],
-                "sampleRate" to rate, "frameCount" to framesPerBlock, "audioData" to samples[index].copyOf()
-            ))
+            result.add(Block(samples[index].copyOf(), sequences[index], positions[index], times[index], gaps[index]))
             read = (read + 1) % samples.size
             size--
         }

@@ -1,5 +1,6 @@
 package com.ymd.flutter_audio_capture
 
+import android.util.Log
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -23,7 +24,7 @@ class FlutterAudioCapturePlugin: FlutterPlugin, MethodChannel.MethodCallHandler 
                 "startCapture" -> result.success(capture.start(call.argument<Int>("sampleRate") ?: 44100,
                     call.argument<Int>("bufferSize") ?: 512, call.argument<Int>("audioSource"), call.argument<String>("clientId"),
                     requireNotNull(call.argument<Number>("owner")) { "Missing capture owner" }.toLong()))
-                "readCapture" -> result.success(capture.read(call.argument<Number>("generation")!!.toLong(), call.argument<Int>("maxBlocks") ?: 8))
+                "readCapture" -> result.success(capture.read(call.argument<Number>("generation")!!.toLong()))
                 "stopCapture" -> { capture.stop(call.argument<Number>("generation")?.toLong(), call.argument<String>("clientId")); result.success(null) }
                 "clock" -> result.success(System.nanoTime())
                 else -> result.notImplemented()
@@ -37,7 +38,10 @@ class FlutterAudioCapturePlugin: FlutterPlugin, MethodChannel.MethodCallHandler 
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel?.setMethodCallHandler(null)
-        capture.stop(null)
+        // On the platform thread: a stuck capture worker must not fail engine teardown.
+        try { capture.stop(null) } catch (error: IllegalStateException) {
+            Log.w("FlutterAudioCapture", "Capture stop failed at detach", error)
+        }
         channel = null
     }
 }

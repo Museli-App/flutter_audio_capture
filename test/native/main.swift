@@ -11,17 +11,17 @@ func offer(_ q: CaptureQueue, _ position: Int64) {
 }
 offer(queue, 0)
 source.update(repeating: 99, count: 4)
-let first = try queue.take(generation: 7, rate: 44100, maximum: 8).first!
+let first = try queue.take().first!
 precondition(first.audioData.withUnsafeBytes { $0.load(as: Float.self) } == 1)
 for i in 1...33 { offer(queue, Int64(i * 4)) }
-let overflow = try queue.take(generation: 7, rate: 44100, maximum: 8)
+let overflow = try queue.take()
 precondition(overflow.count == 1)
 precondition(overflow[0].discontinuity && overflow[0].firstFrame == 132)
 precondition(first.audioData.withUnsafeBytes { $0.load(as: Float.self) } == 1)
 let closed = CaptureQueue(frames: 4, capacity: 32)
 let finished = DispatchSemaphore(value: 0)
 Thread.detachNewThread {
-    let result = try! closed.take(generation: 8, rate: 44100, maximum: 8)
+    let result = try! closed.take()
     precondition(result.isEmpty)
     finished.signal()
 }
@@ -29,8 +29,12 @@ closed.close()
 precondition(finished.wait(timeout: .now() + 1) == .success)
 let failed = CaptureQueue(frames: 4, capacity: 32)
 failed.close(NSError(domain: "test", code: 42))
-do { _ = try failed.take(generation: 9, rate: 44100, maximum: 8); fatalError("Expected failure") }
+do { _ = try failed.take(); fatalError("Expected failure") }
 catch { precondition((error as NSError).code == 42) }
+let many = CaptureQueue(frames: 4, capacity: 32)
+for i in 0..<10 { offer(many, Int64(i * 4)) }
+let taken = (try many.take().count, try many.take().count)
+precondition(taken == (CaptureQueue.maxTake, 2))
 print("Swift capture ownership, overflow, failure and shutdown checks passed")
 
 // The open that claimed last wins: only the newest claim's start is admitted.
@@ -80,7 +84,7 @@ func feed(_ inputFrame: Int64, _ hostNs: Int64) throws {
     let drained = try pipeline.drainOnce()
     precondition(drained)
     while blocks.count < Int(pipeline.emitted / 441) {
-        blocks += try converted.take(generation: 1, rate: 44100, maximum: Int(pipeline.emitted / 441) - blocks.count)
+        blocks += try converted.take()
     }
 }
 func near(_ a: Int64, _ b: Int64) -> Bool { abs(a - b) < 100_000 }
@@ -104,3 +108,19 @@ for (inputStart, hostStart) in [(Int64(14_400), Int64(1_300_000_000)), (Int64(19
 }
 precondition(blocks.enumerated().allSatisfy { $0.element.firstFrame == Int64($0.offset) * 441 })
 print("Swift capture pipeline positions, gap flags and clock continuity checks passed")
+
+// A rebuilt pipeline (input change) carries positions on and marks only its first block discontinuous.
+let rebuiltQueue = CaptureQueue(frames: 441, capacity: 64)
+let rebuilt = try CapturePipeline(format: hardware, frames: 441, rate: 44100, queue: rebuiltQueue, from: 8820)
+var rebuiltBlocks = [CapturePacket]()
+for i in 0..<5 {
+    CaptureInputRingOffer(rebuilt.ring, &tapList, 480, Int64(i) * 480,
+        AVAudioTime.hostTime(forSeconds: 3 + Double(i) * 0.01), true)
+    _ = try rebuilt.drainOnce()
+    while rebuiltBlocks.count < Int((rebuilt.emitted - 8820) / 441) { rebuiltBlocks += try rebuiltQueue.take() }
+}
+precondition(rebuiltBlocks.count >= 3 && rebuiltBlocks[0].firstFrame == 8820)
+precondition(rebuiltBlocks[0].discontinuity && rebuiltBlocks.dropFirst().allSatisfy { !$0.discontinuity })
+let fresh = try CapturePipeline(format: hardware, frames: 441, rate: 44100, queue: rebuiltQueue)
+precondition(fresh.emitted == 0)
+print("Swift capture rebuild continuity checks passed")

@@ -2,10 +2,8 @@ import Foundation
 
 /// Converted PCM shared by the conversion and platform-channel workers.
 struct CapturePacket {
-    let generation, sequence, firstFrame, captureTimeNs: Int64
+    let sequence, firstFrame, captureTimeNs: Int64
     let discontinuity: Bool
-    let sampleRate: Double
-    let frameCount: Int
     let audioData: Data
 }
 
@@ -14,6 +12,9 @@ final class CaptureQueue {
     static func capacity(sampleRate: Double, frames: Int) -> Int {
         max(32, Int((2.0 * sampleRate / Double(frames)).rounded(.up)))
     }
+
+    /// Blocks per read.
+    static let maxTake = 8
 
     private let available = NSCondition()
     private let storage: UnsafeMutablePointer<Float>
@@ -65,7 +66,7 @@ final class CaptureQueue {
         available.signal()
     }
 
-    func take(generation: Int64, rate: Double, maximum: Int) throws -> [CapturePacket] {
+    func take() throws -> [CapturePacket] {
         available.lock()
         defer { available.unlock() }
         let deadline = Date(timeIntervalSinceNow: 0.25)
@@ -74,12 +75,11 @@ final class CaptureQueue {
         }
         if let error = failure { throw error }
         var result = [CapturePacket]()
-        for _ in 0..<min(count, max(1, min(8, maximum))) {
+        for _ in 0..<min(count, Self.maxTake) {
             let index = read
             let data = Data(bytes: storage.advanced(by: index * frames), count: frames * MemoryLayout<Float>.size)
-            result.append(CapturePacket(generation: generation, sequence: sequences[index],
-                firstFrame: positions[index], captureTimeNs: times[index],
-                discontinuity: gaps[index], sampleRate: rate, frameCount: frames, audioData: data))
+            result.append(CapturePacket(sequence: sequences[index], firstFrame: positions[index],
+                captureTimeNs: times[index], discontinuity: gaps[index], audioData: data))
             read = (read + 1) % capacity
             count -= 1
         }

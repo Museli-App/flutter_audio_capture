@@ -1,5 +1,12 @@
+import Foundation
+
 /// A later claim replaced this start's; nothing current was touched.
 struct CaptureSuperseded: Error {}
+
+/// Every other capture failure, reported as CAPTURE_FAILED.
+func captureError(_ message: String) -> NSError {
+    NSError(domain: "AudioCapture", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+}
 
 /// One counter, which is the newest claim; calls arrive on one serial queue, so claims keep the order opens began.
 struct CaptureClaims {
