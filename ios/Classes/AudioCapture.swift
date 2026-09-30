@@ -2,9 +2,14 @@ import AVFoundation
 
 /// The host owns the audio session; the sink only copies hardware PCM.
 public class AudioCapture {
-    let audioEngine = AVAudioEngine()
-    private var sink: AVAudioSinkNode?
+    /// Called when the running engine reconfigures, which stops it; read at each start.
+    var onReconfigure: (() -> Void)?
+    // One engine per start: a media-services reset leaves an engine dead, and reusing it raises.
+    private var engine: AVAudioEngine?
+    private var reconfigured: NSObjectProtocol?
     private var pipeline: CapturePipeline?
+
+    var isRunning: Bool { engine?.isRunning ?? false }
 
     func startSession(bufferSize: UInt32, sampleRate: Double, queue: CaptureQueue) throws {
         try start(frames: Int(bufferSize), rate: sampleRate, queue: queue, from: 0)
@@ -19,7 +24,11 @@ public class AudioCapture {
 
     private func start(frames: Int, rate: Double, queue: CaptureQueue, from emitted: Int64) throws {
         stopSession()
-        let input = audioEngine.inputNode
+        let engine = AVAudioEngine()
+        let input = try catchingRaises { engine.inputNode }
+        // With no live input the hardware format is empty, and connecting to it raises.
+        let hardware = input.inputFormat(forBus: 0)
+        guard hardware.sampleRate > 0, hardware.channelCount > 0 else { throw captureError("No audio input format") }
         let format = input.outputFormat(forBus: 0)
         let pipeline = try CapturePipeline(format: format, frames: frames, rate: rate, queue: queue, from: emitted)
         // Only the C ring crosses into the real-time block: no Swift object to retain there.
@@ -33,32 +42,44 @@ public class AudioCapture {
                 valid ? Int64(stamp.mSampleTime) : 0, stamp.mHostTime, valid)
             return noErr
         }
+        self.engine = engine
         self.pipeline = pipeline
-        self.sink = sink
-        audioEngine.attach(sink)
-        audioEngine.connect(input, to: sink, format: format)
         pipeline.start()
         do {
-            audioEngine.prepare()
-            try audioEngine.start()
+            try catchingRaises {
+                engine.attach(sink)
+                engine.connect(input, to: sink, format: format)
+                engine.prepare()
+                try engine.start()
+            }
         } catch {
             stopSession()
             throw error
         }
+        // After start, so the host's pre-start session setup can't trigger it.
+        let notify = onReconfigure
+        reconfigured = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+            object: engine, queue: nil) { _ in notify?() }
     }
 
     public func stopSession() {
-        audioEngine.stop()
-        if let sink = sink {
-            audioEngine.disconnectNodeInput(sink)
-            audioEngine.detach(sink)
-        }
-        sink = nil
+        if let observer = reconfigured { NotificationCenter.default.removeObserver(observer) }
+        reconfigured = nil
+        // The engine takes its sink with it; a dead one may raise even on stop.
+        if let engine = engine { try? catchingRaises { engine.stop() } }
+        engine = nil
         pipeline?.stop()
         pipeline = nil
     }
 
     deinit { stopSession() }
+}
+
+/// Runs AVAudioEngine calls, so a raised NSException (which Swift can't catch) throws instead.
+func catchingRaises<T>(_ body: () throws -> T) throws -> T {
+    var result: Result<T, Error>?
+    try CaptureExceptionCatcher.run { result = Result(catching: body) }
+    return try result!.get()
 }
 
 final class CapturePipeline {

@@ -44,9 +44,10 @@ final class CaptureController {
             let next = CaptureQueue(frames: frames, capacity: CaptureQueue.capacity(sampleRate: rate, frames: frames))
             queue = next
             observeRoute(generation)
+            let token = generation
+            audioCapture.onReconfigure = { [weak self] in self?.scheduleRebuild(token) }
             do {
                 try audioCapture.startSession(bufferSize: UInt32(frames), sampleRate: rate, queue: next)
-                observeEngine(generation)
                 return ["generation": generation, "sampleRate": rate]
             } catch {
                 next.close(error)
@@ -57,32 +58,30 @@ final class CaptureController {
         }
     }
 
-    // Output-only and category changes keep the mic; an input change rebuilds.
+    // Output-only and category changes keep the mic; an input change rebuilds. A media reset kills the
+    // engine whatever it reports, so it always rebuilds.
     private func observeRoute(_ token: Int64) {
+        let center = NotificationCenter.default
         observers = [
-            NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
+            center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
                 queue: nil) { [weak self] _ in self?.scheduleRebuild(token) },
+            center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil,
+                queue: nil) { [weak self] _ in self?.scheduleRebuild(token, force: true) },
         ]
     }
 
-    // After start, so the app's pre-start session setup can't trigger it; a real reconfiguration stops the engine.
-    private func observeEngine(_ token: Int64) {
-        observers.append(NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-            object: audioCapture.audioEngine, queue: nil) { [weak self] _ in self?.scheduleRebuild(token) })
-    }
-
     // Off the notifying thread, so the engine never restarts inside its own notification.
-    private func scheduleRebuild(_ token: Int64) {
-        rebuilds.async { [weak self] in self?.rebuild(token) }
+    private func scheduleRebuild(_ token: Int64, force: Bool = false) {
+        rebuilds.async { [weak self] in self?.rebuild(token, force: force) }
     }
 
-    /// Keeps capturing through an input change or engine reconfiguration, as Android does, and marks
+    /// Keeps capturing through an input change, engine reconfiguration or media reset, as Android does, and marks
     /// the next block discontinuous. One change fires both notifications, so the second finds nothing.
-    private func rebuild(_ token: Int64) {
+    private func rebuild(_ token: Int64, force: Bool) {
         locked {
             guard token == generation, let current = queue else { return }
             let uid = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
-            guard uid != inputUid || !audioCapture.audioEngine.isRunning else { return }
+            guard force || uid != inputUid || !audioCapture.isRunning else { return }
             do {
                 guard let uid = uid else { throw captureError("No audio input") }
                 try audioCapture.restart(queue: current)

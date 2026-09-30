@@ -124,3 +124,17 @@ precondition(rebuiltBlocks[0].discontinuity && rebuiltBlocks.dropFirst().allSati
 let fresh = try CapturePipeline(format: hardware, frames: 441, rate: 44100, queue: rebuiltQueue)
 precondition(fresh.emitted == 0)
 print("Swift capture rebuild continuity checks passed")
+
+// AVAudioEngine raises NSExceptions (a media reset's dead input); they must reach Swift as errors, not abort.
+do {
+    try catchingRaises {
+        NSException(name: NSExceptionName("com.apple.coreaudio.avfaudio"), reason: "Input HW format is invalid",
+            userInfo: nil).raise()
+    }
+    fatalError("Expected the raise as an error")
+} catch { precondition(error.localizedDescription == "Input HW format is invalid") }
+do { try catchingRaises { throw captureError("thrown") }; fatalError("Expected the throw") }
+catch { precondition(error.localizedDescription == "thrown") }
+let returned = try catchingRaises { 7 }
+precondition(returned == 7)
+print("Swift capture exception catcher checks passed")
